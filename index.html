@@ -81,7 +81,7 @@
   .panel h2 { font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 16px 0 8px; }
   .panel h2:first-child { margin-top: 0; }
   .when { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-  label.field { display: block; font-size: 13px; color: var(--muted); }
+  label.field, .field { display: block; font-size: 13px; color: var(--muted); }
   select, input[type="number"], input[type="search"] {
     width: 100%;
     margin-top: 4px;
@@ -150,6 +150,23 @@
     padding: 8px 10px;
   }
   .search-results button:last-child { border-bottom: 0; }
+  .search-results button[aria-selected="true"] { background: #e7f3ec; }
+  .search-results button span { color: var(--muted); font-size: 13px; }
+  .search-results mark { background: #efe4c6; color: inherit; }
+  .search-group {
+    position: sticky;
+    top: 0;
+    background: #f3eee6;
+    color: var(--muted);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 6px 10px;
+  }
+  .search-results.above {
+    top: auto;
+    bottom: calc(100% + 4px);
+  }
   .search-results small, .universe small { display: block; color: var(--muted); font-size: 12px; }
   .universe { margin-top: 10px; }
   .universe summary { cursor: pointer; color: var(--muted); font-size: 13px; }
@@ -279,12 +296,12 @@
       </div>
       <p class="hint">Type a new capital and leave the field, or press Rescale mix. Each stock keeps its share of the mix.</p>
 
-      <div id="catalog">
-        <label class="field" style="margin-top:14px">Add a stock, ETF, or leveraged ETF
-          <select id="picker" aria-label="Add a stock, ETF, or leveraged ETF">
-            <option value="">Choose…</option>
-          </select>
-        </label>
+      <div id="catalog" class="field" style="margin-top:14px">
+        <label for="picker-search">Add a stock, ETF, or leveraged ETF</label>
+        <div class="search-wrap">
+          <input id="picker-search" type="search" placeholder="Search ticker or name" autocomplete="off" spellcheck="false" role="combobox" aria-expanded="false" aria-controls="picker-results" aria-autocomplete="list">
+          <div id="picker-results" class="search-results" role="listbox" hidden></div>
+        </div>
       </div>
 
       <h2>Keep adding</h2>
@@ -570,20 +587,109 @@ function fillDateSelects() {
   year.innerHTML = years.map(y => `<option value="${y}">${y}</option>`).join("");
 }
 
+let pickerQuery = "";
+let pickerActive = 0;
+let pickerMatches = [];
+
+function matchRank(stock, q) {
+  const sym = stock.symbol.toLowerCase();
+  const name = stock.name.toLowerCase();
+  if (sym === q) return 0;
+  if (sym.startsWith(q)) return 1;
+  if (name.startsWith(q)) return 2;
+  if (sym.includes(q)) return 3;
+  return 4;
+}
+
+function highlight(text, q) {
+  if (!q) return esc(text);
+  const i = text.toLowerCase().indexOf(q);
+  if (i < 0) return esc(text);
+  return esc(text.slice(0, i)) + "<mark>" + esc(text.slice(i, i + q.length)) + "</mark>" + esc(text.slice(i + q.length));
+}
+
+function placePicker() {
+  const input = document.getElementById("picker-search");
+  const box = document.getElementById("picker-results");
+  const rect = input.getBoundingClientRect();
+  const spaceBelow = window.innerHeight - rect.bottom;
+  box.classList.toggle("above", spaceBelow < 280 && rect.top > spaceBelow);
+}
+
 function renderPicker() {
-  const picker = document.getElementById("picker");
+  const input = document.getElementById("picker-search");
+  const box = document.getElementById("picker-results");
+  if (!input || !box || box.hidden) return;
+  const q = pickerQuery.trim().toLowerCase();
   const chosen = new Set(state.holdings.map(h => h.symbol));
-  const parts = ['<option value="">Choose…</option>'];
+  pickerMatches = [];
+  const parts = [];
   for (const [kind, label] of GROUPS) {
-    const items = book.stocks
-      .filter(s => s.kind === kind && !chosen.has(s.symbol))
-      .sort((a, b) => a.symbol.localeCompare(b.symbol));
+    let items = book.stocks.filter(s => s.kind === kind && !chosen.has(s.symbol));
+    if (q) items = items.filter(s => s.symbol.toLowerCase().includes(q) || s.name.toLowerCase().includes(q));
+    items.sort((a, b) => (q ? matchRank(a, q) - matchRank(b, q) : 0) || a.symbol.localeCompare(b.symbol));
     if (!items.length) continue;
-    parts.push(`<optgroup label="${label} (${items.length})">`);
-    for (const s of items) parts.push(`<option value="${esc(s.symbol)}">${esc(s.symbol)} — ${esc(s.name)}</option>`);
-    parts.push("</optgroup>");
+    parts.push(`<div class="search-group">${esc(label)} · ${items.length}</div>`);
+    for (const s of items) {
+      const i = pickerMatches.length;
+      pickerMatches.push(s.symbol);
+      parts.push(`<button type="button" role="option" id="pick-${i}" data-symbol="${esc(s.symbol)}" aria-selected="${i === pickerActive ? "true" : "false"}"><strong>${highlight(s.symbol, q)}</strong> <span>${highlight(s.name, q)}</span></button>`);
+    }
   }
-  picker.innerHTML = parts.join("");
+  if (!pickerMatches.length) {
+    box.innerHTML = `<div class="empty">No match for “${esc(pickerQuery.trim())}”.</div>`;
+    input.removeAttribute("aria-activedescendant");
+    placePicker();
+    return;
+  }
+  if (pickerActive >= pickerMatches.length) pickerActive = pickerMatches.length - 1;
+  if (pickerActive < 0) pickerActive = 0;
+  box.innerHTML = parts.join("");
+  const options = box.querySelectorAll("[role=option]");
+  options.forEach((btn, i) => btn.setAttribute("aria-selected", i === pickerActive ? "true" : "false"));
+  const active = options[pickerActive];
+  if (active) input.setAttribute("aria-activedescendant", active.id);
+  placePicker();
+}
+
+function openPicker() {
+  const box = document.getElementById("picker-results");
+  const input = document.getElementById("picker-search");
+  if (!box.hidden) {
+    renderPicker();
+    return;
+  }
+  box.hidden = false;
+  input.setAttribute("aria-expanded", "true");
+  pickerActive = 0;
+  renderPicker();
+}
+
+function closePicker() {
+  const box = document.getElementById("picker-results");
+  const input = document.getElementById("picker-search");
+  box.hidden = true;
+  box.innerHTML = "";
+  input.setAttribute("aria-expanded", "false");
+  input.removeAttribute("aria-activedescendant");
+  pickerMatches = [];
+}
+
+function movePicker(delta) {
+  if (!pickerMatches.length) return;
+  pickerActive = (pickerActive + delta + pickerMatches.length) % pickerMatches.length;
+  renderPicker();
+  const active = document.getElementById("pick-" + pickerActive);
+  if (active) active.scrollIntoView({ block: "nearest" });
+}
+
+function choosePicker(symbol) {
+  const pick = symbol || pickerMatches[pickerActive];
+  if (!pick) return;
+  pickerQuery = "";
+  document.getElementById("picker-search").value = "";
+  closePicker();
+  addHolding(pick);
 }
 
 function percentLabels() {
@@ -611,7 +717,7 @@ function renderHoldings() {
           <button type="button" class="text-btn" data-remove="${esc(s.symbol)}">Remove</button>
         </div>`;
       }).join("")
-    : `<p class="hint">Choose a stock, ETF, or leveraged ETF from the list. The first one starts at $10,000.</p>`;
+    : `<p class="hint">Search for a stock, ETF, or leveraged ETF. The first one starts at $10,000.</p>`;
   const capital = document.getElementById("capital");
   if (document.activeElement !== capital) capital.value = sumAmounts() ? String(sumAmounts()) : "";
 }
@@ -1257,10 +1363,40 @@ function wire() {
     syncControls();
     draw();
   });
-  document.getElementById("picker").addEventListener("change", e => {
-    const symbol = e.target.value;
-    if (!symbol) return;
-    addHolding(symbol);
+  const pickerSearch = document.getElementById("picker-search");
+  const pickerResults = document.getElementById("picker-results");
+  pickerSearch.addEventListener("focus", openPicker);
+  pickerSearch.addEventListener("click", openPicker);
+  pickerSearch.addEventListener("input", () => {
+    pickerQuery = pickerSearch.value;
+    pickerActive = 0;
+    openPicker();
+  });
+  pickerSearch.addEventListener("keydown", e => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (pickerResults.hidden) openPicker();
+      else movePicker(1);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (pickerResults.hidden) openPicker();
+      else movePicker(-1);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (pickerResults.hidden) openPicker();
+      else choosePicker();
+    } else if (e.key === "Escape") {
+      closePicker();
+    }
+  });
+  pickerSearch.addEventListener("blur", () => {
+    window.setTimeout(closePicker, 0);
+  });
+  pickerResults.addEventListener("mousedown", e => e.preventDefault());
+  pickerResults.addEventListener("click", e => {
+    const btn = e.target.closest("[data-symbol]");
+    if (!btn) return;
+    choosePicker(btn.dataset.symbol);
   });
 }
 
