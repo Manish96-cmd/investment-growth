@@ -419,6 +419,23 @@ function dollars(n) {
   return formatMoney(n, "USD");
 }
 
+function formatPrice(usd, fx) {
+  const n = usd * (state.currency === "INR" ? fx : 1);
+  const inr = state.currency === "INR";
+  const sym = inr ? "₹" : "$";
+  const loc = inr ? "en-IN" : "en-US";
+  const abs = Math.abs(n);
+  const digits = abs >= 1 ? 2 : abs >= 0.01 ? 4 : 6;
+  return (n < 0 ? "−" : "") + sym + Math.abs(n).toLocaleString(loc, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits
+  });
+}
+
+function priceBits(prices, fx, funded) {
+  return prices.map((px, i) => `${funded[i].symbol} ${formatPrice(px, fx)}`).join(" · ");
+}
+
 function tone(n) {
   const rounded = Math.round(n);
   if (rounded < 0) return "down";
@@ -491,9 +508,11 @@ function simulate() {
     const fx = useInr ? fxMap.get(t) : 1;
     if (!fx) return { error: "fx-gap", t };
     const values = [];
+    const prices = [];
     for (let k = 0; k < funded.length; k++) {
       const px = bySymbol[funded[k].symbol].map.get(t);
       if (!px) return { error: "gap", t };
+      prices.push(px);
       const dollars = addUsd * weights[k];
       if (dollars > 0) shares[k] += dollars / px;
       values.push(shares[k] * px * fx);
@@ -503,7 +522,7 @@ function simulate() {
     const value = values.reduce((a, b) => a + b, 0);
     const prev = rows.length ? rows[rows.length - 1].value : 0;
     rows.push({
-      t, add, invested, value, values, fx,
+      t, add, invested, value, values, prices, fx,
       profit: value - invested,
       monthProfit: value - prev - add
     });
@@ -800,6 +819,7 @@ function summaryText(result) {
     `Money put in: ${money(last.invested)}.`,
     `Account value: ${money(last.value)}.`,
     `Profit: ${money(last.profit)}.`,
+    `Month-end price: ${priceBits(last.prices, last.fx, result.funded)}.`,
     `Each ${state.currency === "INR" ? "rupee" : "dollar"} put in is worth ${sym}${(last.value / last.invested).toFixed(2)}.${pace}`,
     "History only. Dividends reinvested. Fees, taxes, and inflation are not included."
   ].join(" ");
@@ -885,7 +905,7 @@ function paintStory(result) {
       <div><dt>Profit</dt><dd class="${profitClass}">${money(last.profit)}</dd></div>
       <div><dt>${paceLabel}</dt><dd>${paceValue}<span style="display:block;font-size:12px;color:var(--muted);font-weight:400">a year</span></dd></div>
     </dl>
-    <p class="plain">${sentence} ${paceLabel === "Money-weighted" ? "The yearly pace is the rate that turns these deposits into this ending value." : "The yearly pace is compound growth of the original amount."} It describes this history only.</p>
+    <p class="plain">${sentence} ${paceLabel === "Money-weighted" ? "The yearly pace is the rate that turns these deposits into this ending value." : "The yearly pace is compound growth of the original amount."} It describes this history only. Month-end price: ${priceBits(last.prices, last.fx, result.funded)}.</p>
     <button type="button" class="copy" id="copy-result">Copy this result</button>
     <p class="hint" id="copy-status"></p>`;
   document.getElementById("copy-result").addEventListener("click", async () => {
@@ -955,7 +975,7 @@ function paintCharts(result) {
     },
     readout(row) {
       const fxBit = state.currency === "INR" ? ` · ₹${row.fx.toFixed(2)} per dollar` : "";
-      return `${labelMonth(row.t)} · account ${money(row.value)} · put in ${money(row.invested)} · profit ${money(row.profit)}${fxBit}`;
+      return `${labelMonth(row.t)} · ${priceBits(row.prices, row.fx, result.funded)} · account ${money(row.value)} · put in ${money(row.invested)} · profit ${money(row.profit)}${fxBit}`;
     },
     readoutEl: document.getElementById("growth-readout")
   });
@@ -970,7 +990,8 @@ function paintCharts(result) {
     aria: `Profit by calendar year from ${result.years[0].year} to ${result.years[result.years.length - 1].year}.`,
     readout(y) {
       const partial = y.months < 12 ? ` · ${y.months} months` : "";
-      return `${y.year}${partial} · profit ${money(y.profit)} · ended at ${money(y.endValue)} · added ${money(y.added)}`;
+      const end = y.monthRows[y.monthRows.length - 1];
+      return `${y.year}${partial} · ${priceBits(end.prices, end.fx, result.funded)} · profit ${money(y.profit)} · ended at ${money(y.endValue)} · added ${money(y.added)}`;
     },
     readoutEl: document.getElementById("year-readout")
   });
@@ -984,7 +1005,7 @@ function paintCharts(result) {
     tick: r => (r.t % 100 === 1 ? String(Math.floor(r.t / 100)) : ""),
     aria: `Profit by month from ${range}.`,
     readout(r) {
-      return `${labelMonth(r.t)} · profit ${money(r.monthProfit)} · account ${money(r.value)}`;
+      return `${labelMonth(r.t)} · ${priceBits(r.prices, r.fx, result.funded)} · profit ${money(r.monthProfit)} · account ${money(r.value)}`;
     },
     readoutEl: document.getElementById("month-readout")
   });
@@ -1046,6 +1067,11 @@ function mountLines(host, spec) {
   const yLabel = svgEl(svg, "text", { x: 16, y: plot.top + plot.h / 2, "text-anchor": "middle", transform: `rotate(-90 16 ${plot.top + plot.h / 2})` });
   yLabel.textContent = spec.yLabel;
   spec.draw(svg, { xs, ys, plot });
+  const step = n > 1 ? plot.w / (n - 1) : plot.w;
+  if (step >= 8) {
+    xs.forEach((x, i) => svgEl(svg, "circle", { cx: x, cy: ys[0][i], r: 2.5, fill: "#0f6a45" }));
+  }
+  const dot = svgEl(svg, "circle", { r: 4.5, fill: "#0f6a45", stroke: "#f7f4ef", "stroke-width": "2" });
   const hover = svgEl(svg, "line", { y1: plot.top, y2: plot.base, stroke: "#221e1a", "stroke-width": "1", visibility: "hidden" });
   svgEl(svg, "rect", { x: plot.left, y: plot.top, width: plot.w, height: plot.h, fill: "transparent" });
   const overlay = svg.lastChild;
@@ -1054,6 +1080,8 @@ function mountLines(host, spec) {
     hover.setAttribute("x1", xs[i]);
     hover.setAttribute("x2", xs[i]);
     hover.setAttribute("visibility", "visible");
+    dot.setAttribute("cx", xs[i]);
+    dot.setAttribute("cy", ys[0][i]);
     spec.readoutEl.textContent = spec.readout(row);
   };
   show(n - 1);
@@ -1177,6 +1205,8 @@ function paintTables(result) {
       putIn,
       value,
       profit: value - putIn,
+      startPrice: result.rows[0].prices[i],
+      endPrice: last.prices[i],
       color: COLORS[i % COLORS.length]
     };
   }).sort((a, b) => b.value - a.value);
@@ -1186,11 +1216,13 @@ function paintTables(result) {
     return `<span style="width:${w}%;background:${p.color}"></span>`;
   }).join("");
   const legend = parts.map(p =>
-    `<li><i class="swatch" style="background:${p.color}"></i>${esc(p.name)} ${money(p.value)}</li>`
+    `<li><i class="swatch" style="background:${p.color}"></i>${esc(p.name)} ${money(p.value)} · ${formatPrice(p.endPrice, last.fx)}</li>`
   ).join("");
 
   const stockRows = parts.map(p => `<tr>
     <td>${esc(p.name)} <span style="color:var(--muted)">${esc(p.symbol)}</span></td>
+    <td class="num">${formatPrice(p.startPrice, fx0)}</td>
+    <td class="num">${formatPrice(p.endPrice, last.fx)}</td>
     <td class="num">${money(p.start)}</td>
     <td class="num">${money(p.later)}</td>
     <td class="num">${money(p.putIn)}</td>
@@ -1199,19 +1231,31 @@ function paintTables(result) {
   </tr>`).join("");
 
   const inr = state.currency === "INR";
-  const yearRows = result.years.map(y => `<tr>
-    <td>${y.year}${y.months < 12 ? ` (${y.months} mo)` : ""}</td>
-    <td class="num">${money(y.added)}</td>
-    <td class="num">${money(y.endValue)}</td>
-    ${inr ? `<td class="num">${y.monthRows[y.monthRows.length - 1].fx.toFixed(2)}</td>` : ""}
-    <td class="num ${tone(y.profit)}">${money(y.profit)}</td>
-    <td class="num ${tone(y.endProfit)}">${money(y.endProfit)}</td>
-  </tr>`).join("");
+  const priceHeads = result.funded.map(h =>
+    `<th class="num" title="${esc(bySymbol[h.symbol].name)}, month-end adjusted close">${esc(h.symbol)} price</th>`
+  ).join("");
+  const priceNote = result.funded.length === 1
+    ? `The ${result.funded[0].symbol} price is the month-end adjusted close.`
+    : "Each ticker price is that holding’s month-end adjusted close.";
+  const yearRows = result.years.map(y => {
+    const end = y.monthRows[y.monthRows.length - 1];
+    return `<tr>
+      <td>${y.year}${y.months < 12 ? ` (${y.months} mo)` : ""}</td>
+      ${end.prices.map(px => `<td class="num">${formatPrice(px, end.fx)}</td>`).join("")}
+      <td class="num">${money(y.added)}</td>
+      <td class="num">${money(y.endValue)}</td>
+      ${inr ? `<td class="num">${end.fx.toFixed(2)}</td>` : ""}
+      <td class="num ${tone(y.profit)}">${money(y.profit)}</td>
+      <td class="num ${tone(y.endProfit)}">${money(y.endProfit)}</td>
+    </tr>`;
+  }).join("");
 
   const monthBlocks = result.years.map((y, idx) => {
     const open = idx >= result.years.length - 2 ? " open" : "";
+    const end = y.monthRows[y.monthRows.length - 1];
     const body = y.monthRows.map(r => `<tr>
       <td>${labelMonth(r.t)}</td>
+      ${r.prices.map(px => `<td class="num">${formatPrice(px, r.fx)}</td>`).join("")}
       <td class="num">${money(r.add)}</td>
       ${inr ? `<td class="num">${r.fx.toFixed(2)}</td>` : ""}
       <td class="num">${money(r.value)}</td>
@@ -1219,9 +1263,9 @@ function paintTables(result) {
       <td class="num ${tone(r.profit)}">${money(r.profit)}</td>
     </tr>`).join("");
     return `<details class="year"${open}>
-      <summary><strong>${y.year}</strong> · profit ${money(y.profit)} · value ${money(y.endValue)}</summary>
+      <summary><strong>${y.year}</strong> · ${priceBits(end.prices, end.fx, result.funded)} · profit ${money(y.profit)} · value ${money(y.endValue)}</summary>
       <div class="table-wrap"><table>
-        <thead><tr><th>Month</th><th class="num">Added</th>${inr ? `<th class="num">Rupees per dollar</th>` : ""}<th class="num">Account value</th><th class="num">Profit that month</th><th class="num">Profit since start</th></tr></thead>
+        <thead><tr><th>Month</th>${priceHeads}<th class="num">Added</th>${inr ? `<th class="num">Rupees per dollar</th>` : ""}<th class="num">Account value</th><th class="num">Profit that month</th><th class="num">Profit since start</th></tr></thead>
         <tbody>${body}</tbody>
       </table></div>
     </details>`;
@@ -1230,29 +1274,29 @@ function paintTables(result) {
   host.innerHTML = `
     <section class="section">
       <h2>Each stock at the end</h2>
-      <p class="caption">Ending value uses the same monthly prices as the charts. Added later is the scheduled money, split by the starting mix. ${labelMonth(result.rows[0].t)}–${labelMonth(last.t)}.</p>
+      <p class="caption">Price at the start and price at the end are the month-end adjusted closes. Ending value uses those same prices. Added later is the scheduled money, split by the starting mix. ${labelMonth(result.rows[0].t)}–${labelMonth(last.t)}.</p>
       <div class="stack" aria-hidden="true">${stack}</div>
       <ul class="stack-legend">${legend}</ul>
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Stock</th><th class="num">At the start</th><th class="num">Added later</th><th class="num">Put in</th><th class="num">Value</th><th class="num">Profit</th>
+          <th>Stock</th><th class="num">Price at start</th><th class="num">Price at end</th><th class="num">At the start</th><th class="num">Added later</th><th class="num">Put in</th><th class="num">Value</th><th class="num">Profit</th>
         </tr></thead>
         <tbody>${stockRows}</tbody>
       </table></div>
     </section>
     <section class="section">
       <h2>Every year</h2>
-      <p class="caption">Profit that year is the change in value minus money added during the year. A year with fewer than 12 months is the partial stretch at the beginning or the end.</p>
+      <p class="caption">Profit that year is the change in value minus money added during the year. A year with fewer than 12 months is the partial stretch at the beginning or the end. ${priceNote}</p>
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Year</th><th class="num">Added</th><th class="num">Value at year-end</th>${inr ? `<th class="num">Rupees per dollar, year-end</th>` : ""}<th class="num">Profit that year</th><th class="num">Profit since start</th>
+          <th>Year</th>${priceHeads}<th class="num">Added</th><th class="num">Value at year-end</th>${inr ? `<th class="num">Rupees per dollar, year-end</th>` : ""}<th class="num">Profit that year</th><th class="num">Profit since start</th>
         </tr></thead>
         <tbody>${yearRows}</tbody>
       </table></div>
     </section>
     <section class="section">
       <h2>Every month</h2>
-      <p class="caption">Open a year to see each month. The latest years start open.</p>
+      <p class="caption">Open a year to see each month. The latest years start open. ${priceNote}</p>
       ${monthBlocks}
     </section>`;
 }
