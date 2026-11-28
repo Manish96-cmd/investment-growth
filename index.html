@@ -215,6 +215,9 @@
   }
   .notice p { margin: 0 0 12px; }
   .growth-block { margin-top: 40px; }
+  .future-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 14px 0; }
+  .future-actions .presets { margin-top: 0; }
+  .future-actions .copy { margin-top: 0; }
   .caption { margin: 0; color: var(--muted); font-size: 13px; max-width: 78ch; }
   .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 12px 0; font-size: 13px; }
   .legend i { display: inline-block; width: 18px; height: 3px; margin-right: 6px; vertical-align: middle; }
@@ -324,6 +327,7 @@
 
   <div id="charts"></div>
   <div id="tables"></div>
+  <div id="futures"></div>
   <p class="foot" id="foot"></p>
 </main>
 
@@ -825,6 +829,323 @@ function summaryText(result) {
   ].join(" ");
 }
 
+const FUTURE_PATHS = 1000;
+const FUTURE_BLOCK = 12;
+let simYears = 20;
+let simSeed = 1;
+let futureCache = null;
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function jointSample(funded) {
+  let t = Math.max(...funded.map(h => bySymbol[h.symbol].start), book.fxStart);
+  const end = Math.min(...funded.map(h => bySymbol[h.symbol].end), book.fxEnd);
+  t = addMonths(t, 1);
+  const obs = [];
+  let first = null;
+  let last = null;
+  for (; t <= end; t = addMonths(t, 1)) {
+    const prev = addMonths(t, -1);
+    const fx = fxMap.get(t);
+    const fxPrev = fxMap.get(prev);
+    if (!fx || !fxPrev) continue;
+    const rets = [];
+    let ok = true;
+    for (const h of funded) {
+      const px = bySymbol[h.symbol].map.get(t);
+      const px0 = bySymbol[h.symbol].map.get(prev);
+      if (!px || !px0) { ok = false; break; }
+      rets.push(px / px0 - 1);
+    }
+    if (!ok) continue;
+    if (first == null) first = t;
+    last = t;
+    obs.push({ rets, fxRatio: fx / fxPrev });
+  }
+  return { obs, first, last };
+}
+
+function percentile(values, p) {
+  const s = Array.from(values);
+  s.sort((a, b) => a - b);
+  return s[Math.round((s.length - 1) * p)];
+}
+
+function runFutures(funded) {
+  const sample = jointSample(funded);
+  if (sample.obs.length < 12) return { error: "short", sample };
+  const capital = funded.reduce((s, h) => s + h.amount, 0);
+  const weights = funded.map(h => h.amount / capital);
+  const steps = simYears * 12;
+  const points = steps + 1;
+  const T = sample.obs.length;
+  const k = funded.length;
+  const rng = mulberry32((simSeed * 100003 + T * 17 + simYears) >>> 0);
+  const startFx = fxMap.get(book.fxEnd);
+  const valueUsd = Array.from({ length: points }, () => new Float64Array(FUTURE_PATHS));
+  const valueInr = Array.from({ length: points }, () => new Float64Array(FUTURE_PATHS));
+  const putUsd = Array.from({ length: points }, () => new Float64Array(FUTURE_PATHS));
+  const putInr = Array.from({ length: points }, () => new Float64Array(FUTURE_PATHS));
+  const endUsd = new Array(FUTURE_PATHS);
+  const endInr = new Array(FUTURE_PATHS);
+  let behindUsd = 0;
+  let behindInr = 0;
+
+  for (let p = 0; p < FUTURE_PATHS; p++) {
+    const hold = new Float64Array(k);
+    let fx = startFx;
+    let investedUsd = 0;
+    let investedInr = 0;
+    let idx = Math.floor(rng() * T);
+    for (let m = 0; m < points; m++) {
+      if (m > 0) {
+        const obs = sample.obs[idx];
+        for (let j = 0; j < k; j++) hold[j] *= 1 + obs.rets[j];
+        fx *= obs.fxRatio;
+        idx = rng() < 1 / FUTURE_BLOCK ? Math.floor(rng() * T) : (idx + 1) % T;
+      }
+      let add = 0;
+      if (m === 0) add = capital;
+      else if (state.frequency === "month") add = state.contribution;
+      else if (state.frequency === "year" && m % 12 === 0) add = state.contribution;
+      if (add) {
+        for (let j = 0; j < k; j++) hold[j] += add * weights[j];
+        investedUsd += add;
+        investedInr += add * fx;
+      }
+      let usd = 0;
+      for (let j = 0; j < k; j++) usd += hold[j];
+      const inr = usd * fx;
+      valueUsd[m][p] = usd;
+      valueInr[m][p] = inr;
+      putUsd[m][p] = investedUsd;
+      putInr[m][p] = investedInr;
+    }
+    const usdEnd = valueUsd[steps][p];
+    const inrEnd = valueInr[steps][p];
+    const putU = putUsd[steps][p];
+    const putI = putInr[steps][p];
+    endUsd[p] = { value: usdEnd, put: putU, profit: usdEnd - putU };
+    endInr[p] = { value: inrEnd, put: putI, profit: inrEnd - putI };
+    if (usdEnd < putU) behindUsd++;
+    if (inrEnd < putI) behindInr++;
+  }
+
+  const pack = (values, puts) => {
+    const rows = [];
+    for (let m = 0; m < points; m++) {
+      rows.push({
+        year: m / 12,
+        low: percentile(values[m], 0.1),
+        mid: percentile(values[m], 0.5),
+        high: percentile(values[m], 0.9),
+        invested: percentile(puts[m], 0.5)
+      });
+    }
+    return rows;
+  };
+  const pick = (ends, p) => {
+    const s = ends.slice().sort((a, b) => a.value - b.value);
+    return s[Math.round((s.length - 1) * p)];
+  };
+
+  return {
+    sample,
+    paths: FUTURE_PATHS,
+    block: FUTURE_BLOCK,
+    years: simYears,
+    usd: pack(valueUsd, putUsd),
+    inr: pack(valueInr, putInr),
+    cards: {
+      USD: { low: pick(endUsd, 0.1), mid: pick(endUsd, 0.5), high: pick(endUsd, 0.9), behind: behindUsd },
+      INR: { low: pick(endInr, 0.1), mid: pick(endInr, 0.5), high: pick(endInr, 0.9), behind: behindInr }
+    },
+    leveraged: funded.some(h => bySymbol[h.symbol].kind === "leveraged"),
+    startFx
+  };
+}
+
+function futureKey(funded) {
+  return [
+    simSeed,
+    simYears,
+    state.frequency,
+    state.contribution,
+    funded.map(h => `${h.symbol}:${h.amount}`).join(",")
+  ].join("|");
+}
+
+function paintFutures() {
+  const host = document.getElementById("futures");
+  const funded = fundedHoldings();
+  if (!funded.length) { host.innerHTML = ""; return; }
+  const key = futureKey(funded);
+  if (!futureCache || futureCache.key !== key) {
+    futureCache = { key, result: runFutures(funded) };
+  }
+  const sim = futureCache.result;
+  const yearButtons = [10, 20, 30].map(y =>
+    `<button type="button" class="preset" data-years="${y}" aria-pressed="${y === simYears}">${y} years</button>`
+  ).join("");
+
+  if (sim.error === "short") {
+    const span = sim.sample.obs.length
+      ? `${labelMonth(sim.sample.first)}–${labelMonth(sim.sample.last)}`
+      : "no overlapping months";
+    host.innerHTML = `
+      <section class="section">
+        <h2>Possible futures</h2>
+        <div class="notice"><p>These holdings share ${sim.sample.obs.length} months of prices (${span}). That is too short to reshuffle into realistic paths. The history above still stands.</p></div>
+      </section>`;
+    return;
+  }
+
+  const currency = state.currency === "INR" ? "INR" : "USD";
+  const rows = currency === "INR" ? sim.inr : sim.usd;
+  const cards = sim.cards[currency];
+  const last = rows[rows.length - 1];
+  const names = funded.map(h => bySymbol[h.symbol].symbol).join(", ");
+  const short = sim.sample.obs.length < simYears * 12
+    ? ` These holdings share ${Math.round(sim.sample.obs.length / 12)} years of history, which is shorter than this horizon, so every path reuses months.`
+    : "";
+  const lever = sim.leveraged
+    ? " Leveraged funds multiply daily moves, so the band is much wider than for a plain stock."
+    : "";
+  const behind = cards.behind === 0
+    ? `In all ${sim.paths.toLocaleString("en-US")} paths, the ending value was above the money put in.`
+    : cards.behind === sim.paths
+      ? `In all ${sim.paths.toLocaleString("en-US")} paths, the ending value was below the money put in.`
+      : `In ${cards.behind.toLocaleString("en-US")} of ${sim.paths.toLocaleString("en-US")} paths, the ending value finished below the money put in.`;
+
+  host.innerHTML = `
+    <section class="section">
+      <h2>Possible futures</h2>
+      <p class="caption">Same deposits, many outcomes. This starts again from your starting amounts and runs for the number of years you pick. It does not continue the chart above. Each path keeps about a year of real months for ${esc(names)}, then jumps to another real stretch. The shade is the middle 800 of ${sim.paths.toLocaleString("en-US")} paths. The line is the midpoint. Numbers along the bottom are years from the first investment.</p>
+      <div class="future-actions">
+        <div class="presets">${yearButtons}</div>
+        <button type="button" class="copy" id="future-reroll">Run again</button>
+      </div>
+      <div class="legend">
+        <span><i class="area"></i>Most paths</span>
+        <span><i class="area" style="border-bottom-color:var(--green);background:transparent"></i>Middle</span>
+        <span><i class="invested"></i>Typical money put in</span>
+      </div>
+      <div class="plot" id="future-plot"></div>
+      <p class="readout" id="future-readout"></p>
+      <dl class="stats">
+        <div>
+          <dt>Lower case</dt>
+          <dd class="${tone(cards.low.profit)}">${money(cards.low.value)}</dd>
+          <p class="hint">1 in 10 finish below this. Profit ${money(cards.low.profit)}. Put in ${money(cards.low.put)}.</p>
+        </div>
+        <div>
+          <dt>Middle</dt>
+          <dd class="${tone(cards.mid.profit)}">${money(cards.mid.value)}</dd>
+          <p class="hint">Half finish below, half above. Profit ${money(cards.mid.profit)}. Put in ${money(cards.mid.put)}.</p>
+        </div>
+        <div>
+          <dt>Higher case</dt>
+          <dd class="${tone(cards.high.profit)}">${money(cards.high.value)}</dd>
+          <p class="hint">1 in 10 finish above this. Profit ${money(cards.high.profit)}. Put in ${money(cards.high.put)}.</p>
+        </div>
+      </dl>
+      <p class="plain">${behind}</p>
+      <p class="caption">Drawn from ${labelMonth(sim.sample.first)}–${labelMonth(sim.sample.last)}, ${sim.sample.obs.length.toLocaleString("en-US")} months these holdings have in common, not only the dates in the chart above. In rupees, each path also reshuffles the rupee’s monthly moves, starting from ₹${sim.startFx.toFixed(2)} per dollar.${short}${lever} A smooth bell-curve draw would miss real crashes. This cannot invent a market these holdings never had. Fees, taxes, and inflation are not included. It is not a forecast.</p>
+    </section>`;
+
+  mountBand(document.getElementById("future-plot"), {
+    rows,
+    height: 380,
+    aria: `Possible account value over ${sim.years} years. Middle ending value ${money(last.mid)}. Lower ${money(last.low)}. Higher ${money(last.high)}.`,
+    readoutEl: document.getElementById("future-readout"),
+    readout(row) {
+      const label = row.year === 0 ? "Start" : `Year ${Number.isInteger(row.year) ? row.year : row.year.toFixed(1)}`;
+      return `${label} · lower ${money(row.low)} · middle ${money(row.mid)} · higher ${money(row.high)} · typical money put in ${money(row.invested)}`;
+    }
+  });
+}
+
+function mountBand(host, spec) {
+  const width = Math.max(320, host.clientWidth || host.parentElement.clientWidth || 640);
+  const height = spec.height;
+  const plot = { left: 88, right: 12, top: 16, bottom: 42 };
+  plot.w = width - plot.left - plot.right;
+  plot.h = height - plot.top - plot.bottom;
+  const vals = spec.rows.flatMap(r => [r.low, r.mid, r.high, r.invested]);
+  let min = Math.min(0, ...vals);
+  let max = Math.max(...vals);
+  if (min === max) max = min + 1;
+  const pad = (max - min) * 0.06;
+  max += pad;
+  if (min < 0) min -= pad;
+  const yTicks = niceTicks(min, max, 5);
+  const yMin = Math.min(min, yTicks[0]);
+  const yMax = Math.max(max, yTicks[yTicks.length - 1]);
+  const yAt = v => plot.top + (yMax - v) / (yMax - yMin) * plot.h;
+  const n = spec.rows.length;
+  const xAt = i => plot.left + (n === 1 ? plot.w / 2 : (i / (n - 1)) * plot.w);
+  const xs = spec.rows.map((_, i) => xAt(i));
+
+  const svg = svgEl(host, "svg", { viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": spec.aria });
+  for (const tick of yTicks) {
+    const y = yAt(tick);
+    svgEl(svg, "line", { x1: plot.left, x2: width - plot.right, y1: y, y2: y, stroke: "#e0d8cc" });
+    svgEl(svg, "text", { x: plot.left - 8, y: y + 4, "text-anchor": "end" }).textContent = compactMoney(tick);
+  }
+  const years = spec.rows[n - 1].year;
+  const step = years <= 10 ? 2 : 5;
+  spec.rows.forEach((row, i) => {
+    if (row.year % step !== 0 && i !== n - 1) return;
+    if (!Number.isInteger(row.year) && i !== n - 1) return;
+    svgEl(svg, "text", { x: xs[i], y: height - 16, "text-anchor": "middle" }).textContent = String(row.year);
+  });
+  const yLabel = svgEl(svg, "text", { x: 16, y: plot.top + plot.h / 2, "text-anchor": "middle", transform: `rotate(-90 16 ${plot.top + plot.h / 2})` });
+  yLabel.textContent = state.currency === "INR" ? "Rupees" : "Dollars";
+
+  const band = [`M ${xs[0]} ${yAt(spec.rows[0].low)}`];
+  for (let i = 1; i < n; i++) band.push(`L ${xs[i]} ${yAt(spec.rows[i].low)}`);
+  for (let i = n - 1; i >= 0; i--) band.push(`L ${xs[i]} ${yAt(spec.rows[i].high)}`);
+  band.push("Z");
+  svgEl(svg, "path", { d: band.join(" "), fill: "#cfe3d8", stroke: "none" });
+  const mid = xs.map((x, i) => `${i ? "L" : "M"} ${x} ${yAt(spec.rows[i].mid)}`).join(" ");
+  svgEl(svg, "path", { d: mid, fill: "none", stroke: "#0f6a45", "stroke-width": "2" });
+  const invested = xs.map((x, i) => `${i ? "L" : "M"} ${x} ${yAt(spec.rows[i].invested)}`).join(" ");
+  svgEl(svg, "path", { d: invested, fill: "none", stroke: "#5c564e", "stroke-width": "1.5", "stroke-dasharray": "4 4" });
+
+  const hover = svgEl(svg, "line", { y1: plot.top, y2: plot.top + plot.h, stroke: "#221e1a", "stroke-width": "1", visibility: "hidden" });
+  const dot = svgEl(svg, "circle", { r: 4, fill: "#0f6a45", stroke: "#f7f4ef", "stroke-width": "2" });
+  const overlay = svgEl(svg, "rect", { x: plot.left, y: plot.top, width: plot.w, height: plot.h, fill: "transparent" });
+  const show = i => {
+    hover.setAttribute("x1", xs[i]);
+    hover.setAttribute("x2", xs[i]);
+    hover.setAttribute("visibility", "visible");
+    dot.setAttribute("cx", xs[i]);
+    dot.setAttribute("cy", yAt(spec.rows[i].mid));
+    spec.readoutEl.textContent = spec.readout(spec.rows[i]);
+  };
+  show(n - 1);
+  overlay.addEventListener("mousemove", ev => {
+    const box = svg.getBoundingClientRect();
+    const x = ((ev.clientX - box.left) / box.width) * width;
+    let i = 0;
+    let best = Infinity;
+    xs.forEach((px, idx) => {
+      const d = Math.abs(px - x);
+      if (d < best) { best = d; i = idx; }
+    });
+    show(i);
+  });
+  overlay.addEventListener("mouseleave", () => show(n - 1));
+}
+
 function draw() {
   const result = simulate();
   document.getElementById("split-note").textContent = splitSentence(result.error ? null : result);
@@ -840,6 +1161,7 @@ function draw() {
   paintStory(result);
   paintCharts(result);
   paintTables(result);
+  paintFutures();
   writeHash();
 }
 
@@ -1333,6 +1655,20 @@ function readHash() {
 
 function wire() {
   document.getElementById("plan").addEventListener("submit", e => e.preventDefault());
+  document.getElementById("futures").addEventListener("click", e => {
+    const years = e.target.closest("[data-years]");
+    if (years) {
+      const next = Number(years.dataset.years);
+      if (next === simYears) return;
+      simYears = next;
+      draw();
+      return;
+    }
+    if (e.target.closest("#future-reroll")) {
+      simSeed++;
+      draw();
+    }
+  });
   document.getElementById("presets").addEventListener("click", e => {
     const btn = e.target.closest("[data-preset]");
     if (!btn) return;
@@ -1452,7 +1788,7 @@ function onDate() {
 }
 
 document.getElementById("foot").textContent =
-  "Prices are Yahoo Finance monthly adjusted closes, downloaded 24 Nov 2026, through Oct 2026. Dividends are reinvested and splits are adjusted. The list is the S&P 500, major ETFs, and leveraged and inverse ETFs. Rupee figures use FRED series DEXINUS, the rupees-per-dollar rate at each month-end, from 1973 through Oct 2026. The latest unfinished month is left out. Nothing here is a forecast, a recommendation, or a live quote. Fees, taxes, and inflation are not taken out.";
+  "Prices are Yahoo Finance monthly adjusted closes, downloaded 24 Nov 2026, through Oct 2026. Dividends are reinvested and splits are adjusted. The list is the S&P 500, major ETFs, and leveraged and inverse ETFs. Rupee figures use FRED series DEXINUS, the rupees-per-dollar rate at each month-end, from 1973 through Oct 2026. The possible-futures section reshuffles those past months, about a year at a time. The latest unfinished month is left out. Nothing here is a forecast, a recommendation, or a live quote. Fees, taxes, and inflation are not taken out.";
 
 const fromHash = readHash();
 if (fromHash) {
